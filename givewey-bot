@@ -20,6 +20,18 @@ db = pymysql.connect(
     database='myzemex_givebot'
 )
 
+def get_db_cursor():
+    # переподключиться при разрыве соединения.
+    try:
+        db.ping(reconnect=True)
+    except Exception as e:
+        logging.error(f"Ошибка при ping к БД: {e}")
+        # Можно тут заново db = pymysql.connect(...) вызвать
+        # но лучше один раз держать db глобально.
+    return db.cursor()
+
+
+
 def escape_markdown_v2(text):
     """Экранируем специальные символы для MarkdownV2 с двойным экранированием точки"""
     special_chars = r'_*[]()~`>#+-=|{}!'
@@ -54,7 +66,7 @@ attached_groups = []
 def load_subscriptions():
     global attached_channels, attached_groups
     try:
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT type, identifier, name FROM subscriptions")
             for sub_type, identifier, name in cursor.fetchall():
                 if sub_type == 'channel':
@@ -89,7 +101,7 @@ edit_sessions = {}
 @authorized_only
 def show_giveaways_for_editing(message):
     try:
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             # Получаем только активные розыгрыши
             cursor.execute("SELECT id, title FROM giveaways WHERE end_time > NOW()")
             giveaways = cursor.fetchall()
@@ -123,7 +135,7 @@ def start_edit_process(call):
     try:
         giveaway_id = int(call.data.split('_')[1])
 
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT id, title, description, winners_count, end_time FROM giveaways WHERE id = %s", (giveaway_id,))
             giveaway = cursor.fetchone()
 
@@ -221,7 +233,7 @@ def save_field_edit(message):
 
         # Формирование запроса к базе данных
         query = f"UPDATE giveaways SET {field} = %s WHERE id = %s"
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute(query, (new_value, giveaway_id))
             db.commit()
 
@@ -238,7 +250,7 @@ def save_field_edit(message):
 @authorized_only
 def draw_giveaway(message):
     try:
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute(
                 "SELECT id, title, winners_count FROM giveaways "
                 "WHERE winners IS NULL AND end_time <= NOW()"
@@ -326,7 +338,7 @@ def finalize_draw(call):
         session = edit_sessions.pop(call.message.chat.id, None)
         place = session['place']
 
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             # Получаем список участников
             cursor.execute(
                 "SELECT id, user_id, username FROM users WHERE giveaway_id = %s",
@@ -365,7 +377,7 @@ def finalize_draw(call):
         response_text += "\nВсем спасибо за участие!\n"
 
         # Обновляем БД
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("UPDATE giveaways SET winners = %s WHERE id = %s", (str(winners_data), giveaway_id))
             db.commit()
 
@@ -375,7 +387,7 @@ def finalize_draw(call):
         # Отправляем результаты
         if place == 'channel':
             logging.info("Начата публикация в канале.")
-            with db.cursor() as cursor:
+            with get_db_cursor() as cursor:
                 cursor.execute("SELECT identifier FROM subscriptions WHERE type = 'channel'")
                 channel = cursor.fetchone()
 
@@ -396,7 +408,7 @@ def finalize_draw(call):
 
         elif place == 'group':
             logging.info("Начата публикация в группе.")
-            with db.cursor() as cursor:
+            with get_db_cursor() as cursor:
                 cursor.execute("SELECT identifier FROM subscriptions WHERE type = 'group'")
                 group = cursor.fetchone()
 
@@ -442,7 +454,7 @@ def attach_channel(message):
 
         if not any(channel['id'] == channel_id for channel in attached_channels):
             attached_channels.append({'id': channel_id, 'name': channel_name})
-            with db.cursor() as cursor:
+            with get_db_cursor() as cursor:
                 cursor.execute("INSERT INTO subscriptions (type, identifier, name) VALUES ('channel', %s, %s)", (channel_id, channel_name))
                 db.commit()
             bot.reply_to(message, f"Канал {channel_name} успешно прикреплён!")
@@ -470,7 +482,7 @@ def attach_group(message):
 
         if not any(group['id'] == group_id for group in attached_groups):
             attached_groups.append({'id': group_id, 'name': group_name})
-            with db.cursor() as cursor:
+            with get_db_cursor() as cursor:
                 cursor.execute("INSERT INTO subscriptions (type, identifier, name) VALUES ('group', %s, %s)", (group_id, group_name))
                 db.commit()
             bot.reply_to(message, f"Группа {group_name} успешно прикреплена!")
@@ -564,7 +576,7 @@ def save_giveaway(message, title, description, winners_count):
         end_time = datetime.strptime(message.text, '%d.%m.%Y %H:%M')
         query = "INSERT INTO giveaways (title, description, winners_count, end_time) VALUES (%s, %s, %s, %s)"
 
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute(query, (title, description, winners_count, end_time))
             db.commit()
 
@@ -582,7 +594,7 @@ def save_giveaway(message, title, description, winners_count):
 @authorized_only
 def publish_giveaway(message):
     try:
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT id, title, description, winners_count, end_time FROM giveaways WHERE end_time > NOW()")
             giveaways = cursor.fetchall()
 
@@ -663,7 +675,7 @@ def publish_to_channel(call):
         logging.info(f"Публикация розыгрыша с ID: {giveaway_id} в канале")
 
         # Получаем данные о розыгрыше
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute(
                 "SELECT title, description, winners_count, end_time "
                 "FROM giveaways WHERE id = %s",
@@ -678,7 +690,7 @@ def publish_to_channel(call):
         title, description, winners_count, end_time = giveaway
 
         # Считаем текущее число участников
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute(
                 "SELECT COUNT(*) FROM users WHERE giveaway_id = %s",
                 (giveaway_id,)
@@ -686,7 +698,7 @@ def publish_to_channel(call):
             participants_count = cursor.fetchone()[0]
 
         # Получаем идентификатор канала
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT identifier FROM subscriptions WHERE type = 'channel'")
             channel = cursor.fetchone()
 
@@ -734,7 +746,7 @@ def publish_to_group(call):
         logging.info(f"Публикация розыгрыша с ID: {giveaway_id} в чате")
 
         # Получаем данные о розыгрыше
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute(
                 "SELECT title, description, winners_count, end_time "
                 "FROM giveaways WHERE id = %s",
@@ -749,7 +761,7 @@ def publish_to_group(call):
         title, description, winners_count, end_time = giveaway
 
         # Считаем текущее число участников
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute(
                 "SELECT COUNT(*) FROM users WHERE giveaway_id = %s",
                 (giveaway_id,)
@@ -757,7 +769,7 @@ def publish_to_group(call):
             participants_count = cursor.fetchone()[0]
 
         # Получаем идентификатор чата
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT identifier FROM subscriptions WHERE type = 'group'")
             group = cursor.fetchone()
 
@@ -814,7 +826,7 @@ def view_giveaway(message):
         giveaway_id = int(giveaway_id_str)
 
         # 1) Получаем информацию о самом розыгрыше
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute(
                 "SELECT title, description, winners_count, end_time "
                 "FROM giveaways WHERE id = %s",
@@ -829,7 +841,7 @@ def view_giveaway(message):
         title, description, winners_count, end_time = giveaway
 
         # 2) Получаем количество участников
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute(
                 "SELECT COUNT(*) FROM users WHERE giveaway_id = %s",
                 (giveaway_id,)
@@ -895,7 +907,7 @@ def handle_join(call):
             )
             return
 
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT id FROM users WHERE giveaway_id = %s AND user_id = %s", (giveaway_id, user_id))
             if cursor.fetchone():
                 bot.answer_callback_query(
@@ -920,7 +932,12 @@ def handle_join(call):
 
     except Exception as e:
         logging.error(f"Ошибка при участии в розыгрыше: {e}")
-        bot.send_message(call.message.chat.id, "Произошла ошибка при участии. Попробуйте снова.")
+        # bot.send_message(call.message.chat.id, "Произошла ошибка при участии. Попробуйте снова.")
+        bot.answer_callback_query(
+            call.id,
+            text="Произошла ошибка при участии. Попробуйте немного позже...",
+            show_alert=True
+        )
 
 
 
@@ -929,7 +946,7 @@ def handle_join(call):
 @authorized_only
 def show_all_giveaways(message):
     try:
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT id, title, description, winners_count, end_time FROM giveaways ORDER BY end_time DESC")
             giveaways = cursor.fetchall()
 
@@ -965,7 +982,7 @@ def delete_giveaway(message):
     try:
         # Получаем все розыгрыши (активные и завершённые), 
         # либо только активные — выбирайте сами логику
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT id, title FROM giveaways ORDER BY end_time DESC")
             giveaways = cursor.fetchall()
 
@@ -1008,7 +1025,7 @@ def confirm_delete(call):
         giveaway_id = int(data_parts[1])
 
         # Достаём информацию о выбранном розыгрыше
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("SELECT title FROM giveaways WHERE id = %s", (giveaway_id,))
             giveaway = cursor.fetchone()
 
@@ -1054,12 +1071,12 @@ def finalize_delete(call):
         giveaway_id = int(data_parts[1])
 
         # Удаляем из таблицы 'users' (опционально, если хотите очищать участников тоже)
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("DELETE FROM users WHERE giveaway_id = %s", (giveaway_id,))
             db.commit()
 
         # Удаляем сам розыгрыш
-        with db.cursor() as cursor:
+        with get_db_cursor() as cursor:
             cursor.execute("DELETE FROM giveaways WHERE id = %s", (giveaway_id,))
             db.commit()
 
