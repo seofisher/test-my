@@ -1,0 +1,1102 @@
+import telebot
+import pymysql
+from flask import Flask, request
+import logging
+from datetime import datetime
+import random
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+import re
+
+# Инициализация бота
+TOKEN = '8183993638:AAEmRRaXUJQ1LoC3iUIpABmo4r0vz0CiMTg'
+bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
+
+# Подключение к базе данных
+db = pymysql.connect(
+    host='myzemex.mysql.tools',
+    user='myzemex_givebot',
+    password='65Ma-r7_yN',
+    database='myzemex_givebot'
+)
+
+def escape_markdown_v2(text):
+    """Экранируем специальные символы для MarkdownV2 с двойным экранированием точки"""
+    special_chars = r'_*[]()~`>#+-=|{}!'
+    for char in special_chars:
+        text = text.replace(char, f"\\{char}")
+    # Дважды экранируем точки
+    text = text.replace('.', '\\.')
+    return text
+
+
+
+# Настраиваем логирование
+logging.basicConfig(level=logging.INFO)
+
+# доступ только для выбраного ID телеграм
+ALLOWED_USERS = [279721068]  # Замените 123456789 на ваш Telegram ID
+
+# Декоратор для проверки авторизации пользователя
+def authorized_only(func):
+    def wrapper(message, *args, **kwargs):
+        if message.from_user.id not in ALLOWED_USERS:
+            bot.send_message(message.chat.id, "У вас нет доступа к этой команде.")
+            return
+        return func(message, *args, **kwargs)
+    return wrapper
+
+# Списки для хранения прикрепленных каналов и групп
+attached_channels = []
+attached_groups = []
+
+# Загрузка прикрепленных каналов и групп из базы данных при старте бота
+def load_subscriptions():
+    global attached_channels, attached_groups
+    try:
+        with db.cursor() as cursor:
+            cursor.execute("SELECT type, identifier, name FROM subscriptions")
+            for sub_type, identifier, name in cursor.fetchall():
+                if sub_type == 'channel':
+                    attached_channels.append({'id': identifier, 'name': name})
+                elif sub_type == 'group':
+                    attached_groups.append({'id': identifier, 'name': name})
+        logging.info("Подключённые каналы и группы успешно загружены.")
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке подписок: {e}")
+
+
+# Setting up a main menu with buttons
+def setup_main_menu():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(
+        KeyboardButton("/events"),
+        KeyboardButton("/publish"),
+        KeyboardButton("/create"),
+        KeyboardButton("/draw"),
+        KeyboardButton("/attach_channel"),
+        KeyboardButton("/attach_group")
+    )
+    return markup
+
+
+
+# Словарь для хранения текущих сессий редактирования пользователей
+edit_sessions = {}
+
+# Обработчик команды /edit для отображения списка активных розыгрышей
+@bot.message_handler(commands=['edit'])
+@authorized_only
+def show_giveaways_for_editing(message):
+    try:
+        with db.cursor() as cursor:
+            # Получаем только активные розыгрыши
+            cursor.execute("SELECT id, title FROM giveaways WHERE end_time > NOW()")
+            giveaways = cursor.fetchall()
+
+        if giveaways:
+            markup = InlineKeyboardMarkup()
+            for giveaway in giveaways:
+                button = InlineKeyboardButton(
+                    text=giveaway[1],  # Название розыгрыша
+                    callback_data=f"edit_{giveaway[0]}"  # ID розыгрыша
+                )
+                markup.add(button)
+
+            bot.send_message(
+                chat_id=message.chat.id,
+                text="✨ *Выберите розыгрыш для редактирования:*",
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+        else:
+            bot.reply_to(message, "Сейчас нет активных розыгрышей.")
+
+    except Exception as e:
+        logging.error(f"Ошибка при отображении списка для редактирования: {e}")
+        bot.reply_to(message, "Произошла ошибка при получении списка. Попробуйте позже.")
+
+
+# Обработчик нажатия на кнопку выбора розыгрыша для редактирования
+@bot.callback_query_handler(func=lambda call: call.data.startswith('edit_'))
+def start_edit_process(call):
+    try:
+        giveaway_id = int(call.data.split('_')[1])
+
+        with db.cursor() as cursor:
+            cursor.execute("SELECT id, title, description, winners_count, end_time FROM giveaways WHERE id = %s", (giveaway_id,))
+            giveaway = cursor.fetchone()
+
+        if giveaway:
+            response_text = (f"*✅ Редактирование розыгрыша:*\n"
+                             f"🏆 *Название:* {giveaway[1]}\n"
+                             f"ℹ️ *Описание:* {giveaway[2]}\n"
+                             f"🎯 *Победителей:* {giveaway[3]}\n"
+                             f"📅 *Окончание:* {giveaway[4].strftime('%d.%m.%Y %H:%M')}\n\n"
+                             f"*Выберите, что хотите изменить:*")
+
+            # Сохраняем ID розыгрыша в сессии
+            edit_sessions[call.message.chat.id] = {'giveaway_id': giveaway_id}
+
+            # Клавиатура для выбора параметра редактирования
+            markup = ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add(KeyboardButton("Название"), KeyboardButton("Описание"))
+            markup.add(KeyboardButton("Победителей"), KeyboardButton("Время окончания"))
+
+            bot.send_message(
+                chat_id=call.message.chat.id,
+                text=response_text,
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+        else:
+            bot.answer_callback_query(call.id, "Розыгрыш не найден или уже завершен.")
+
+    except Exception as e:
+        logging.error(f"Ошибка при выборе розыгрыша для редактирования: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка при выборе розыгрыша. Попробуйте снова.")
+
+
+# Обработчик текстовых сообщений для выбора поля редактирования
+@bot.message_handler(func=lambda message: message.chat.id in edit_sessions and 'field' not in edit_sessions[message.chat.id])
+def handle_field_selection(message):
+    try:
+        field_map = {
+            "Название": "title",
+            "Описание": "description",
+            "Победителей": "winners_count",
+            "Время окончания": "end_time"
+        }
+
+        logging.info(f"[Выбор поля] Получено сообщение от пользователя: {message.text}")
+        
+        selected_field = field_map.get(message.text.strip())  # Убираем лишние пробелы
+        logging.info(f"[Выбор поля] Пользователь выбрал поле: {message.text}, соответствует колонке: {selected_field}")
+
+        if selected_field:
+            # Проверка типа данных для поля
+            if selected_field == "winners_count":
+                bot.send_message(message.chat.id, f"Введите целое число для поля '{message.text}':")
+            elif selected_field == "end_time":
+                bot.send_message(message.chat.id, f"Введите дату и время в формате 26.01.2025 12:15 для поля '{message.text}':")
+            else:
+                bot.send_message(message.chat.id, f"Введите новое значение для поля '{message.text}':")
+
+            # Обновляем сессию пользователя
+            edit_sessions[message.chat.id]['field'] = selected_field
+            logging.info(f"[Выбор поля] Сессия обновлена: {edit_sessions[message.chat.id]}")
+        else:
+            bot.send_message(message.chat.id, "Неверное поле для редактирования. Попробуйте снова.")
+
+    except Exception as e:
+        logging.error(f"Ошибка при выборе поля для редактирования: {e}")
+        bot.send_message(message.chat.id, "Произошла ошибка при выборе поля. Попробуйте снова.")
+
+
+
+# Обработчик текстовых сообщений для сохранения нового значения поля
+@bot.message_handler(func=lambda message: message.chat.id in edit_sessions and 'field' in edit_sessions[message.chat.id])
+def save_field_edit(message):
+    try:
+        session_data = edit_sessions.pop(message.chat.id)
+        giveaway_id = session_data['giveaway_id']
+        field = session_data['field']
+        new_value = message.text
+
+        # Валидация типа данных
+        if field == "winners_count":
+            if not new_value.isdigit():
+                bot.send_message(message.chat.id, "Ошибка: Введите целое число для поля 'Победителей'.")
+                return
+            new_value = int(new_value)
+        elif field == "end_time":
+            try:
+                # Попытка распарсить дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ
+                new_value = datetime.strptime(new_value, "%d.%m.%Y %H:%M")
+            except ValueError:
+                bot.send_message(message.chat.id, "Ошибка: Введите дату и время в правильном формате '26.01.2025 12:15'.")
+                return
+
+        logging.info(f"Сохранение нового значения: поле={field}, значение={new_value}, розыгрыш_id={giveaway_id}")
+
+        # Формирование запроса к базе данных
+        query = f"UPDATE giveaways SET {field} = %s WHERE id = %s"
+        with db.cursor() as cursor:
+            cursor.execute(query, (new_value, giveaway_id))
+            db.commit()
+
+        bot.send_message(message.chat.id, "👌 Поле успешно обновлено!")
+
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении поля: {e}")
+        bot.send_message(message.chat.id, "Произошла ошибка при сохранении. Попробуйте снова.")
+
+# END Edit
+    
+
+@bot.message_handler(commands=['draw'])
+@authorized_only
+def draw_giveaway(message):
+    try:
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, title, winners_count FROM giveaways "
+                "WHERE winners IS NULL AND end_time <= NOW()"
+            )
+            giveaways = cursor.fetchall()
+
+        if giveaways:
+            markup = InlineKeyboardMarkup()
+            for giveaway in giveaways:
+                button = InlineKeyboardButton(
+                    text=giveaway[1],  # Название розыгрыша
+                    callback_data=f"draw_{giveaway[0]}"  # ID розыгрыша
+                )
+                markup.add(button)
+
+            bot.send_message(
+                chat_id=message.chat.id,
+                text="Выберите розыгрыш для проведения:",
+                reply_markup=markup
+            )
+        else:
+            bot.reply_to(message, "Нет завершённых розыгрышей для проведения.")
+
+    except Exception as e:
+        logging.error(f"Ошибка при отображении списка розыгрышей для проведения: {e}")
+        bot.reply_to(message, "Произошла ошибка. Попробуйте позже.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('draw_'))
+def handle_draw(call):
+    try:
+        giveaway_id = int(call.data.split('_')[1])
+        logging.info(f"Пользователь выбрал розыгрыш для проведения с ID: {giveaway_id}")
+
+        # Сохраняем ID розыгрыша в сессии
+        edit_sessions[call.message.chat.id] = {'giveaway_id': giveaway_id}
+
+        # Предлагаем выбрать, где опубликовать результаты
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("📢 В канале", callback_data=f"finalize_channel_{giveaway_id}"),
+            InlineKeyboardButton("💬 В чате", callback_data=f"finalize_group_{giveaway_id}")
+
+        )
+
+        bot.send_message(
+            call.message.chat.id,
+            "Где опубликовать результаты розыгрыша?",
+            reply_markup=markup
+        )
+
+    except Exception as e:
+        logging.error(f"Ошибка при выборе розыгрыша для проведения: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка. Попробуйте снова.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('finalize_')) # тут заменил на finalize_ а было publish_
+def confirm_draw(call):
+    try:
+        data = call.data.split('_')
+        place = data[1]  # channel или group
+        giveaway_id = int(data[2])
+
+        # Сохраняем место публикации в сессии
+        edit_sessions[call.message.chat.id]['place'] = place
+
+        # Запрашиваем подтверждение проведения розыгрыша
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("✅ Да", callback_data=f"confirm_{giveaway_id}"),
+            InlineKeyboardButton("❌ Отмена", callback_data="cancel")
+        )
+
+        bot.send_message(call.message.chat.id, "Вы уверены, что хотите провести розыгрыш?", reply_markup=markup)
+
+    except Exception as e:
+        logging.error(f"Ошибка при подтверждении розыгрыша: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка. Попробуйте снова.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('confirm_'))
+def finalize_draw(call):
+    try:
+        giveaway_id = int(call.data.split('_')[1])
+        session = edit_sessions.pop(call.message.chat.id, None)
+        place = session['place']
+
+        with db.cursor() as cursor:
+            # Получаем список участников
+            cursor.execute(
+                "SELECT id, user_id, username FROM users WHERE giveaway_id = %s",
+                (giveaway_id,)
+            )
+            participants = cursor.fetchall()
+
+            # Получаем количество призовых мест
+            cursor.execute(
+                "SELECT winners_count FROM giveaways WHERE id = %s",
+                (giveaway_id,)
+            )
+            winners_count = cursor.fetchone()[0]
+
+        if len(participants) < winners_count:
+            bot.send_message(call.message.chat.id, "Недостаточно участников для проведения розыгрыша.")
+            return
+
+        # Выбираем победителей случайным образом
+        winners = random.sample(participants, winners_count)
+
+        # Формируем текст для публикации
+        # Пример HTML: <b>Розыгрыш завершён. Победители:</b>
+        response_text = "🎉 <b>Розыгрыш завершён.\n\nПобедители:</b>\n"
+
+        # Сохраняем информацию для базы
+        winners_data = []
+        for position, winner in enumerate(winners, start=1):
+            # user_id = winner[1]  # Если нужно, можете сохранить в winners_data
+            username = winner[2]  # Имя пользователя
+            winners_data.append({"user_id": winner[1], "username": username, "place": position})
+
+            # В HTML-разметке @username можно указывать напрямую
+            response_text += f"{position} место: @{username}\n"
+
+        response_text += "\nВсем спасибо за участие!\n"
+
+        # Обновляем БД
+        with db.cursor() as cursor:
+            cursor.execute("UPDATE giveaways SET winners = %s WHERE id = %s", (str(winners_data), giveaway_id))
+            db.commit()
+
+        logging.info(f"attached_channels: {attached_channels}")
+        logging.info(f"attached_groups: {attached_groups}")
+
+        # Отправляем результаты
+        if place == 'channel':
+            logging.info("Начата публикация в канале.")
+            with db.cursor() as cursor:
+                cursor.execute("SELECT identifier FROM subscriptions WHERE type = 'channel'")
+                channel = cursor.fetchone()
+
+            if channel:
+                try:
+                    bot.send_message(
+                        chat_id=int(channel[0]),
+                        text=response_text,
+                        parse_mode='HTML'  # HTML вместо MarkdownV2
+                    )
+                    logging.info(f"Сообщение успешно отправлено в канал (ID: {channel[0]})")
+                    bot.send_message(call.message.chat.id, "Сообщение с результатами успешно опубликовано в канале.")
+                except Exception as e:
+                    logging.error(f"Ошибка при отправке сообщения в канал (ID: {channel[0]}): {e}")
+                    bot.send_message(call.message.chat.id, "Произошла ошибка при публикации в канал.")
+            else:
+                bot.send_message(call.message.chat.id, "Канал для публикации не найден.")
+
+        elif place == 'group':
+            logging.info("Начата публикация в группе.")
+            with db.cursor() as cursor:
+                cursor.execute("SELECT identifier FROM subscriptions WHERE type = 'group'")
+                group = cursor.fetchone()
+
+            if group:
+                try:
+                    bot.send_message(
+                        chat_id=int(group[0]),
+                        text=response_text,
+                        parse_mode='HTML'  # HTML вместо MarkdownV2
+                    )
+                    logging.info(f"Сообщение успешно отправлено в группу (ID: {group[0]})")
+                    bot.send_message(call.message.chat.id, "Сообщение с результатами успешно опубликовано в группе.")
+                except Exception as e:
+                    logging.error(f"Ошибка при отправке сообщения в группу (ID: {group[0]}): {e}")
+                    bot.send_message(call.message.chat.id, "Произошла ошибка при публикации в группу.")
+            else:
+                bot.send_message(call.message.chat.id, "Группа для публикации не найдена.")
+
+        bot.answer_callback_query(call.id, "Розыгрыш успешно проведён!")
+
+    except Exception as e:
+        logging.error(f"Ошибка при финализации розыгрыша: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка при проведении розыгрыша. Попробуйте снова.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'cancel')
+def cancel_draw(call):
+    bot.answer_callback_query(call.id, "Розыгрыш отменён.")
+    bot.send_message(call.message.chat.id, "Розыгрыш отменён по вашему запросу.")
+
+
+# Команда для прикрепления канала
+@bot.message_handler(commands=['attach_channel'])
+@authorized_only
+def attach_channel(message):
+    try:
+        logging.info(f"Получена команда /attach_channel: {message.text}")
+        channel_id = message.text.split(maxsplit=1)[1]
+        logging.info(f"Попытка прикрепить канал: {channel_id}")
+
+        chat_info = bot.get_chat(channel_id)
+        channel_name = chat_info.username or chat_info.title
+
+        if not any(channel['id'] == channel_id for channel in attached_channels):
+            attached_channels.append({'id': channel_id, 'name': channel_name})
+            with db.cursor() as cursor:
+                cursor.execute("INSERT INTO subscriptions (type, identifier, name) VALUES ('channel', %s, %s)", (channel_id, channel_name))
+                db.commit()
+            bot.reply_to(message, f"Канал {channel_name} успешно прикреплён!")
+            logging.info(f"Канал {channel_id} ({channel_name}) успешно прикреплён и сохранён в базу данных.")
+        else:
+            bot.reply_to(message, "Этот канал уже прикреплён.")
+    except IndexError:
+        bot.reply_to(message, "Пожалуйста, укажите ID канала после команды.")
+    except Exception as e:
+        logging.error(f"Ошибка при прикреплении канала: {e}")
+        bot.reply_to(message, "Произошла ошибка при прикреплении канала.")
+
+
+# Команда для прикрепления группы
+@bot.message_handler(commands=['attach_group'])
+@authorized_only
+def attach_group(message):
+    try:
+        logging.info(f"Получена команда /attach_group: {message.text}")
+        group_id = message.text.split(maxsplit=1)[1]
+        logging.info(f"Попытка прикрепить группу: {group_id}")
+
+        chat_info = bot.get_chat(group_id)
+        group_name = chat_info.username or chat_info.title
+
+        if not any(group['id'] == group_id for group in attached_groups):
+            attached_groups.append({'id': group_id, 'name': group_name})
+            with db.cursor() as cursor:
+                cursor.execute("INSERT INTO subscriptions (type, identifier, name) VALUES ('group', %s, %s)", (group_id, group_name))
+                db.commit()
+            bot.reply_to(message, f"Группа {group_name} успешно прикреплена!")
+            logging.info(f"Группа {group_id} ({group_name}) успешно прикреплена и сохранена в базу данных.")
+        else:
+            bot.reply_to(message, "Эта группа уже прикреплена.")
+    except IndexError:
+        bot.reply_to(message, "Пожалуйста, укажите ID группы после команды.")
+    except Exception as e:
+        logging.error(f"Ошибка при прикреплении группы: {e}")
+        bot.reply_to(message, "Произошла ошибка при прикреплении группы.")
+
+
+@bot.message_handler(commands=['check_subscriptions'])
+@authorized_only
+def check_subscriptions(message):
+    response_text = "✨ <b>Подключённые каналы и группы:</b>\n"
+
+    response_text += "\n<b>Каналы:</b>\n"
+    if attached_channels:
+        channel_lines = []
+        for channel in attached_channels:
+            # Например: "My_Channel (123456789)"
+            channel_lines.append(f"{channel['name']} ({channel['id']})")
+        response_text += "\n".join(channel_lines)
+    else:
+        response_text += "Нет прикреплённых каналов."
+
+    response_text += "\n\n<b>Группы:</b>\n"
+    if attached_groups:
+        group_lines = []
+        for group in attached_groups:
+            # Например: "My_Group (987654321)"
+            group_lines.append(f"{group['name']} ({group['id']})")
+        response_text += "\n".join(group_lines)
+    else:
+        response_text += "Нет прикреплённых групп."
+
+    # Теперь отправляем сообщение с parse_mode='HTML'
+    bot.send_message(message.chat.id, response_text, parse_mode='HTML')
+
+
+
+# Проверка подписки пользователя
+def check_subscription(user_id):
+    try:
+        for channel in attached_channels:
+            channel_status = bot.get_chat_member(channel['id'], user_id).status
+            if channel_status not in ["member", "administrator", "creator"]:
+                return False
+
+        for group in attached_groups:
+            group_status = bot.get_chat_member(group['id'], user_id).status
+            if group_status not in ["member", "administrator", "creator"]:
+                return False
+
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при проверке подписки: {e}")
+        return False
+
+
+# Обработка команды /create – Создание розыгрыша
+@bot.message_handler(commands=['create'])
+@authorized_only
+def create_giveaway(message):
+    bot.send_message(message.chat.id, "Введите название розыгрыша:")
+    bot.register_next_step_handler(message, get_title)
+
+def get_title(message):
+    title = message.text
+    bot.send_message(message.chat.id, "Введите описание розыгрыша:")
+    bot.register_next_step_handler(message, get_description, title)
+
+def get_description(message, title):
+    description = message.text
+    bot.send_message(message.chat.id, "Введите количество победителей (число):")
+    bot.register_next_step_handler(message, get_winners_count, title, description)
+
+def get_winners_count(message, title, description):
+    try:
+        winners_count = int(message.text)
+        bot.send_message(message.chat.id, "Введите дату и время окончания розыгрыша в формате 26.01.2025 12:15")
+        bot.register_next_step_handler(message, save_giveaway, title, description, winners_count)
+    except ValueError:
+        bot.send_message(message.chat.id, "Пожалуйста, введите число.")
+        bot.register_next_step_handler(message, get_winners_count, title, description)
+
+def save_giveaway(message, title, description, winners_count):
+    try:
+        end_time = datetime.strptime(message.text, '%d.%m.%Y %H:%M')
+        query = "INSERT INTO giveaways (title, description, winners_count, end_time) VALUES (%s, %s, %s, %s)"
+
+        with db.cursor() as cursor:
+            cursor.execute(query, (title, description, winners_count, end_time))
+            db.commit()
+
+        bot.send_message(message.chat.id, "👌 Розыгрыш успешно создан!")
+    except ValueError:
+        bot.send_message(message.chat.id, "Некорректный формат даты. Попробуйте снова.")
+    except Exception as e:
+        bot.send_message(message.chat.id, "Произошла ошибка при создании розыгрыша.")
+        logging.error(f"Ошибка при создании розыгрыша: {e}")
+
+
+# /publish -----------------------------------------------------------------------------
+# Обработчик команды /publish – Публикация розыгрыша
+@bot.message_handler(commands=['publish'])
+@authorized_only
+def publish_giveaway(message):
+    try:
+        with db.cursor() as cursor:
+            cursor.execute("SELECT id, title, description, winners_count, end_time FROM giveaways WHERE end_time > NOW()")
+            giveaways = cursor.fetchall()
+
+        if giveaways:
+            markup = InlineKeyboardMarkup()
+            for giveaway in giveaways:
+                button = InlineKeyboardButton(
+                    text=giveaway[1],  # Название розыгрыша
+                    callback_data=f"publish_{giveaway[0]}"  # ID розыгрыша
+                )
+                markup.add(button)
+
+            bot.send_message(
+                chat_id=message.chat.id,
+                text="Выберите розыгрыш для публикации:",
+                reply_markup=markup
+            )
+        else:
+            bot.reply_to(message, "Сейчас нет активных розыгрышей для публикации.")
+
+    except Exception as e:
+        logging.error(f"Ошибка при отображении списка для публикации: {e}")
+        bot.reply_to(message, "Произошла ошибка при получении списка. Попробуйте позже.")
+
+
+# Обработка нажатия на кнопку публикации (выбор розыгрыша)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('publish_'))
+def handle_publish(call):
+    try:
+        data_parts = call.data.split('_')
+        if len(data_parts) < 2:
+            bot.answer_callback_query(call.id, "Некорректные данные. Попробуйте снова.")
+            return
+
+        giveaway_id = int(data_parts[1])
+        logging.info(f"Пользователь выбрал розыгрыш для публикации с ID: {giveaway_id}")
+
+        # Сохраняем ID розыгрыша в сессии
+        edit_sessions[call.message.chat.id] = {'giveaway_id': giveaway_id}
+
+        # Предлагаем выбрать место для публикации
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("📢 Опубликовать в канале", callback_data=f"channel_{giveaway_id}"),
+            InlineKeyboardButton("💬 Опубликовать в чате", callback_data=f"group_{giveaway_id}")
+        )
+
+        # Добавляем кнопку "Отмена"/"Завершить"
+        markup.add(
+            InlineKeyboardButton("❌ Завершить публикацию", callback_data="finish_publication")
+        )
+
+        bot.send_message(call.message.chat.id, "Выберите, где опубликовать розыгрыш:", reply_markup=markup)
+
+    except Exception as e:
+        logging.error(f"Ошибка при выборе места публикации: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка. Попробуйте снова.")
+
+# отмена публикации
+@bot.callback_query_handler(func=lambda call: call.data == "finish_publication")
+def finish_publication(call):
+    # Если у вас используется edit_sessions — очищаем, чтобы бот
+    # «забыл» о процессе публикации/редактирования
+    edit_sessions.pop(call.message.chat.id, None)
+
+    # Закрываем всплывающее окошко
+    bot.answer_callback_query(call.id, "Публикация отменена!")
+
+    # И отправляем сообщение в чат
+    bot.send_message(call.message.chat.id, "Публикация отменена по вашему запросу.")
+
+
+# Публикация в канале (HTML-версия)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('channel_'))
+def publish_to_channel(call):
+    try:
+        giveaway_id = int(call.data.split('_')[1])
+        logging.info(f"Публикация розыгрыша с ID: {giveaway_id} в канале")
+
+        # Получаем данные о розыгрыше
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT title, description, winners_count, end_time "
+                "FROM giveaways WHERE id = %s",
+                (giveaway_id,)
+            )
+            giveaway = cursor.fetchone()
+
+        if not giveaway:
+            bot.answer_callback_query(call.id, "Розыгрыш не найден.")
+            return
+
+        title, description, winners_count, end_time = giveaway
+
+        # Считаем текущее число участников
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM users WHERE giveaway_id = %s",
+                (giveaway_id,)
+            )
+            participants_count = cursor.fetchone()[0]
+
+        # Получаем идентификатор канала
+        with db.cursor() as cursor:
+            cursor.execute("SELECT identifier FROM subscriptions WHERE type = 'channel'")
+            channel = cursor.fetchone()
+
+        if channel is None:
+            bot.answer_callback_query(call.id, "Канал для публикации не найден.")
+            return
+
+        # Формируем HTML-текст
+        response_text = (
+            f"✨ <b>Новый розыгрыш</b>\n\n"
+            f"<b>{title}</b>\n\n"
+            f"{description}\n\n"
+            f"Участников: <b>{participants_count}</b>\n"
+            f"Победителей: <b>{winners_count}</b>\n"
+            f"Окончание: <b>{end_time.strftime('%d.%m %H:%M')}</b> Kyiv\n\n"
+            f"Для участия нужно быть подписаным на канал и чат.\n"
+            f"<a href=\"https://t.me/joni4yarda\">Joni4yarda CRYPTO</a>\n"
+            f"<a href=\"https://t.me/joni4yarda_chat\">Чат Joni4yarda</a>"
+        )
+
+        # Кнопка "Участвовать"
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🎉 Участвовать", callback_data=f"join_{giveaway_id}"))
+
+        # Отправляем сообщение в канал (HTML)
+        bot.send_message(
+            chat_id=channel[0],
+            text=response_text,
+            parse_mode='HTML',
+            reply_markup=markup,
+            disable_web_page_preview=True
+        )
+
+        bot.answer_callback_query(call.id, "Розыгрыш опубликован в канале!")
+    except Exception as e:
+        logging.error(f"Ошибка при публикации в канале: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка при публикации. Попробуйте снова.")
+
+
+# Публикация в чате (HTML-версия)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('group_'))
+def publish_to_group(call):
+    try:
+        giveaway_id = int(call.data.split('_')[1])
+        logging.info(f"Публикация розыгрыша с ID: {giveaway_id} в чате")
+
+        # Получаем данные о розыгрыше
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT title, description, winners_count, end_time "
+                "FROM giveaways WHERE id = %s",
+                (giveaway_id,)
+            )
+            giveaway = cursor.fetchone()
+
+        if not giveaway:
+            bot.answer_callback_query(call.id, "Розыгрыш не найден.")
+            return
+
+        title, description, winners_count, end_time = giveaway
+
+        # Считаем текущее число участников
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM users WHERE giveaway_id = %s",
+                (giveaway_id,)
+            )
+            participants_count = cursor.fetchone()[0]
+
+        # Получаем идентификатор чата
+        with db.cursor() as cursor:
+            cursor.execute("SELECT identifier FROM subscriptions WHERE type = 'group'")
+            group = cursor.fetchone()
+
+        if group is None:
+            bot.answer_callback_query(call.id, "Группа для публикации не найдена.")
+            return
+
+        # Формируем HTML-текст
+        response_text = (
+            f"✨ <b>Новый розыгрыш</b>\n\n"
+            f"<b>{title}</b>\n\n"
+            f"{description}\n\n"
+            f"Участников: <b>{participants_count}</b>\n"
+            f"Победителей: <b>{winners_count}</b>\n"
+            f"Окончание: <b>{end_time.strftime('%d.%m %H:%M')}</b> Kyiv\n\n"
+            f"Для участия нужно быть подписаным на чат и канал.\n"
+            f"<a href=\"https://t.me/joni4yarda\">Joni4yarda CRYPTO</a>\n"
+            f"<a href=\"https://t.me/joni4yarda_chat\">Чат Joni4yarda</a>"
+        )
+
+        # Кнопка "Участвовать"
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🎉 Участвовать", callback_data=f"join_{giveaway_id}"))
+
+        # Отправляем сообщение в группу (HTML)
+        bot.send_message(
+            chat_id=group[0],
+            text=response_text,
+            parse_mode='HTML',
+            reply_markup=markup,
+            disable_web_page_preview=True
+        )
+
+        bot.answer_callback_query(call.id, "Розыгрыш опубликован в чате!")
+    except Exception as e:
+        logging.error(f"Ошибка при публикации в чате: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка при публикации. Попробуйте снова.")
+
+# END публикация анонса
+
+
+# /view Просмотр анонса
+@bot.message_handler(commands=['view'])
+@authorized_only
+def view_giveaway(message):
+    try:
+        # Пытаемся получить ID из команды, например "/view 1"
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            bot.reply_to(message, "Пожалуйста, укажите ID розыгрыша. Пример: /view 1")
+            return
+
+        giveaway_id_str = parts[1]
+        giveaway_id = int(giveaway_id_str)
+
+        # 1) Получаем информацию о самом розыгрыше
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT title, description, winners_count, end_time "
+                "FROM giveaways WHERE id = %s",
+                (giveaway_id,)
+            )
+            giveaway = cursor.fetchone()
+
+        if not giveaway:
+            bot.reply_to(message, "Розыгрыш с таким ID не найден.")
+            return
+
+        title, description, winners_count, end_time = giveaway
+
+        # 2) Получаем количество участников
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM users WHERE giveaway_id = %s",
+                (giveaway_id,)
+            )
+            participants_count = cursor.fetchone()[0]  # Вернёт кортеж (число,)
+
+        # Формируем HTML-текст анонса
+        response_text = (
+            f"✨ <b>Новый розыгрыш</b>\n\n"
+            f"<b>{title}</b>\n\n"
+            f"{description}\n\n"
+            f"Участников: <b>{participants_count}</b>\n"
+            f"Победителей: <b>{winners_count}</b>\n"
+            f"Окончание: <b>{end_time.strftime('%d.%m %H:%M')}</b> Kyiv\n\n"
+            f"Для участия нужно быть подписаным на канал и чат.\n"
+            f"<a href=\"https://t.me/joni4yarda\">Joni4yarda CRYPTO</a>\n"
+            f"<a href=\"https://t.me/joni4yarda_chat\">Чат Joni4yarda</a>"
+        )
+
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🎉 Участвовать", callback_data=f"join_{giveaway_id}"))
+
+        bot.send_message(
+            chat_id=message.chat.id,
+            text=response_text,
+            parse_mode='HTML',
+            reply_markup=markup,
+            disable_web_page_preview=True
+        )
+
+    except ValueError:
+        bot.reply_to(message, "Нужно указать числовой ID розыгрыша. Пример: /view 1")
+    except Exception as e:
+        logging.error(f"Ошибка при просмотре розыгрыша: {e}")
+        bot.reply_to(message, "Произошла ошибка при просмотре. Попробуйте снова.")
+
+# кінець /view
+
+
+
+# Обработка нажатия на кнопку участия в розыгрыше
+@bot.callback_query_handler(func=lambda call: call.data.startswith('join_'))
+def handle_join(call):
+    try:
+        user_id = call.from_user.id
+        username = call.from_user.username  # <-- Сохраняем username
+        giveaway_id = int(call.data.split('_')[1])
+
+        # Проверка, что у пользователя есть username
+        if not username:  # None или пустая строка
+            bot.answer_callback_query(
+                call.id,
+                "❌ Установите username в профиле Telegram, прежде чем участвовать в розыгрыше.",
+                show_alert=True
+            )
+            return
+
+        if not check_subscription(user_id):
+            bot.answer_callback_query(
+                call.id, 
+                "❌ Вы должны подписаться на все каналы и группы, чтобы участвовать в розыгрыше.", 
+                show_alert=True
+            )
+            return
+
+        with db.cursor() as cursor:
+            cursor.execute("SELECT id FROM users WHERE giveaway_id = %s AND user_id = %s", (giveaway_id, user_id))
+            if cursor.fetchone():
+                bot.answer_callback_query(
+                    call.id,
+                    "✅ Вы уже участвуете в этом розыгрыше!",
+                    show_alert=True
+                    )
+                return
+
+            cursor.execute(
+                "INSERT INTO users (giveaway_id, user_id, username) VALUES (%s, %s, %s)",
+                (giveaway_id, user_id, username)
+            )
+            db.commit()
+
+        bot.answer_callback_query(
+            call.id,
+            "✅ Вы успешно зарегистрированы в розыгрыше!",
+            show_alert=True
+        )
+        return
+
+    except Exception as e:
+        logging.error(f"Ошибка при участии в розыгрыше: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка при участии. Попробуйте снова.")
+
+
+
+# Обработка команды /events для показа всех розыгрышей
+@bot.message_handler(commands=['events'])
+@authorized_only
+def show_all_giveaways(message):
+    try:
+        with db.cursor() as cursor:
+            cursor.execute("SELECT id, title, description, winners_count, end_time FROM giveaways ORDER BY end_time DESC")
+            giveaways = cursor.fetchall()
+
+        if giveaways:
+            response_text = "✨ *Список всех розыгрышей:*\n\n"
+            for giveaway in giveaways:
+                # giveaway[0] — id, giveaway[1] — title, giveaway[2] — description,
+                # giveaway[3] — winners_count, giveaway[4] — end_time
+                response_text += (
+                    f"*ID:* {giveaway[0]}\n"
+                    f"*Название:* {giveaway[1]}\n\n"
+                    f"*Описание:* {giveaway[2]}\n\n"
+                    f"*Победителей:* {giveaway[3]}\n"
+                    f"*Окончание:* {giveaway[4].strftime('%d.%m.%Y %H:%M')}\n"
+                    "-----------\n\n"
+                )
+        else:
+            response_text = "❌ Сейчас нет созданных розыгрышей."
+
+        bot.send_message(message.chat.id, response_text, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Ошибка при получении списка розыгрышей: {e}")
+        bot.reply_to(message, "Произошла ошибка при получении списка. Попробуйте позже.")
+
+# -------------------------------
+
+
+# Удаление розыгрыша
+# Команда /delete для удаления розыгрыша
+@bot.message_handler(commands=['delete'])
+@authorized_only
+def delete_giveaway(message):
+    try:
+        # Получаем все розыгрыши (активные и завершённые), 
+        # либо только активные — выбирайте сами логику
+        with db.cursor() as cursor:
+            cursor.execute("SELECT id, title FROM giveaways ORDER BY end_time DESC")
+            giveaways = cursor.fetchall()
+
+        if not giveaways:
+            bot.reply_to(message, "Нет розыгрышей для удаления.")
+            return
+
+        # Формируем список с кнопками
+        markup = InlineKeyboardMarkup()
+        for giveaway in giveaways:
+            giveaway_id = giveaway[0]
+            title = giveaway[1]
+            markup.add(
+                InlineKeyboardButton(
+                    text=title,
+                    callback_data=f"delete_{giveaway_id}"
+                )
+            )
+
+        bot.send_message(
+            chat_id=message.chat.id,
+            text="Выберите розыгрыш, который хотите удалить:",
+            reply_markup=markup
+        )
+
+    except Exception as e:
+        logging.error(f"Ошибка при выводе списка розыгрышей для удаления: {e}")
+        bot.reply_to(message, "Произошла ошибка при получении списка. Попробуйте позже.")
+
+
+# Обработка нажатия на кнопку удаления
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delete_'))
+def confirm_delete(call):
+    try:
+        data_parts = call.data.split('_')
+        if len(data_parts) < 2:
+            bot.answer_callback_query(call.id, "Некорректные данные. Попробуйте снова.")
+            return
+
+        giveaway_id = int(data_parts[1])
+
+        # Достаём информацию о выбранном розыгрыше
+        with db.cursor() as cursor:
+            cursor.execute("SELECT title FROM giveaways WHERE id = %s", (giveaway_id,))
+            giveaway = cursor.fetchone()
+
+        if not giveaway:
+            bot.answer_callback_query(call.id, "Розыгрыш не найден.")
+            return
+
+        title = giveaway[0]
+
+        # Спрашиваем подтверждение
+        markup = InlineKeyboardMarkup()
+        # Кнопка да -> callback_data "deleteconfirm_{id}"
+        # Кнопка нет -> callback_data "deletecancel"
+        markup.add(
+            InlineKeyboardButton("✅ Да, удалить", callback_data=f"deleteconfirm_{giveaway_id}"),
+            InlineKeyboardButton("❌ Отмена", callback_data="deletecancel")
+        )
+
+        bot.send_message(
+            chat_id=call.message.chat.id,
+            text=f"Вы уверены, что хотите удалить розыгрыш: <b>{title}</b>?",
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+
+        # Закрываем alert
+        bot.answer_callback_query(call.id)
+
+    except Exception as e:
+        logging.error(f"Ошибка при подтверждении удаления: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка при подтверждении. Попробуйте снова.")
+
+
+# Обработка подтверждения удаления
+@bot.callback_query_handler(func=lambda call: call.data.startswith('deleteconfirm_'))
+def finalize_delete(call):
+    try:
+        data_parts = call.data.split('_')
+        if len(data_parts) < 2:
+            bot.answer_callback_query(call.id, "Некорректные данные. Попробуйте снова.")
+            return
+
+        giveaway_id = int(data_parts[1])
+
+        # Удаляем из таблицы 'users' (опционально, если хотите очищать участников тоже)
+        with db.cursor() as cursor:
+            cursor.execute("DELETE FROM users WHERE giveaway_id = %s", (giveaway_id,))
+            db.commit()
+
+        # Удаляем сам розыгрыш
+        with db.cursor() as cursor:
+            cursor.execute("DELETE FROM giveaways WHERE id = %s", (giveaway_id,))
+            db.commit()
+
+        bot.send_message(
+            chat_id=call.message.chat.id,
+            text="Розыгрыш успешно удалён."
+        )
+        bot.answer_callback_query(call.id, "Розыгрыш удалён")
+
+    except Exception as e:
+        logging.error(f"Ошибка при удалении розыгрыша: {e}")
+        bot.send_message(call.message.chat.id, "Произошла ошибка при удалении розыгрыша. Попробуйте снова.")
+
+
+# Обработка отмены удаления
+@bot.callback_query_handler(func=lambda call: call.data == 'deletecancel')
+def cancel_delete(call):
+    bot.answer_callback_query(call.id, "Удаление отменено.")
+    bot.send_message(call.message.chat.id, "Операция удаления розыгрыша отменена.")
+
+
+# Конец удаления розыгрыша
+
+
+
+# Вебхук для приема сообщений
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    json_str = request.get_data().decode('utf-8')
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return 'OK', 200
+
+
+if __name__ == '__main__':
+    load_subscriptions()
+    bot.remove_webhook()
+    bot.set_webhook(url='https://giveaways.fishub.net/webhook')
+    app.run(host='127.1.4.66', port=3000)
+
